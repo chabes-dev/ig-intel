@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 
 const SEARCHES_KEY = "ig_intel_searches";
 const ACCESS_PASSWORD_KEY = "ig_intel_password";
+const GEMINI_KEY_KEY = "ig_intel_gemini_key";
 const fmt = (n) => n?.toLocaleString("pt-BR") ?? "-";
 const fmtDate = (iso) => iso ? new Date(iso).toLocaleDateString("pt-BR") : "-";
 const typeLabel = { Image: "Foto", Video: "Video", Sidecar: "Carrossel" };
@@ -21,6 +22,93 @@ function exportCSV(posts, handle) {
   a.click();
 }
 
+async function analyzeWithGemini(geminiKey, posts, handle) {
+  const postsData = posts.slice(0, 50).map((p, i) => ({
+    index: i + 1,
+    type: p.type,
+    date: p.timestamp ? new Date(p.timestamp).toLocaleDateString("pt-BR") : "?",
+    likes: p.likesCount || 0,
+    comments: p.commentsCount || 0,
+    caption: (p.caption || "").slice(0, 300),
+    imageUrl: p.displayUrl || null,
+  }));
+
+  const imageParts = [];
+  for (const p of postsData) {
+    if (p.imageUrl) {
+      try {
+        const res = await fetch("/api/img?url=" + encodeURIComponent(p.imageUrl));
+        if (res.ok) {
+          const blob = await res.blob();
+          const b64 = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result.split(",")[1]);
+            reader.readAsDataURL(blob);
+          });
+          imageParts.push({
+            index: p.index,
+            b64,
+            mimeType: blob.type || "image/jpeg",
+          });
+        }
+      } catch {}
+    }
+  }
+
+  const textSummary = postsData.map(p =>
+    `[Post ${p.index}] ${p.type} | ${p.date} | Likes: ${p.likes} | Comments: ${p.comments}\nCaption: ${p.caption}`
+  ).join("\n\n");
+
+  const parts = [
+    {
+      text: `Você é um assistente especialista em análise de Instagram. Analise os ${postsData.length} posts do perfil @${handle} abaixo.\n\nDADOS DOS POSTS:\n${textSummary}\n\nIMAGENS (${imageParts.length} disponíveis abaixo):\nAnalise cada imagem junto com seus metadados. Identifique: subjects principais, tipo de conteúdo, produtos mostrados, tom visual, texto presente, etc.\n\nApós analisar tudo, responda: "Análise concluída! Tenho ${postsData.length} posts em contexto. Pode me perguntar qualquer coisa sobre o perfil @${handle}."`
+    }
+  ];
+
+  for (const img of imageParts) {
+    parts.push({ text: `\n[Imagem do Post ${img.index}]:` });
+    parts.push({ inlineData: { mimeType: img.mimeType, data: img.b64 } });
+  }
+
+  const res = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + geminiKey,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ parts }] }),
+    }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || "Gemini error " + res.status);
+  }
+  const data = await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "Sem resposta";
+}
+
+async function chatWithGemini(geminiKey, history, userMessage) {
+  const contents = history.map(m => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.text }],
+  }));
+  contents.push({ role: "user", parts: [{ text: userMessage }] });
+
+  const res = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + geminiKey,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents }),
+    }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || "Gemini error " + res.status);
+  }
+  const data = await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "Sem resposta";
+}
+
 export default function App() {
   const [password, setPassword] = useState(() => localStorage.getItem(ACCESS_PASSWORD_KEY) || "");
   const [unlocked, setUnlocked] = useState(false);
@@ -38,15 +126,24 @@ export default function App() {
   const [searches, setSearches] = useState(() => { try { return JSON.parse(localStorage.getItem(SEARCHES_KEY) || "[]"); } catch { return []; } });
   const pollRef = useRef(null);
 
-  useEffect(() => { if (password) setUnlocked(true); }, []);
+  // AI Chat state
+  const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem(GEMINI_KEY_KEY) || "");
+  const [showGeminiSetup, setShowGeminiSetup] = useState(false);
+  const [geminiKeyInput, setGeminiKeyInput] = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
+  const [chatHistory, setChatHistory] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const chatBottomRef = useRef(null);
 
+  useEffect(() => { if (password) setUnlocked(true); }, []);
   useEffect(() => {
     if (!keyword.trim()) { setFiltered(posts); return; }
     const kw = keyword.toLowerCase();
     setFiltered(posts.filter((p) => (p.caption || "").toLowerCase().includes(kw)));
   }, [keyword, posts]);
-
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
+  useEffect(() => { chatBottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatHistory]);
 
   function handleUnlock(e) {
     e.preventDefault();
@@ -61,10 +158,8 @@ export default function App() {
     e.preventDefault();
     if (!handle) return;
     if (pollRef.current) clearInterval(pollRef.current);
-    setLoading(true); setError(""); setStatus("Iniciando scraper..."); setPosts([]); setFiltered([]);
-
+    setLoading(true); setError(""); setStatus("Iniciando scraper..."); setPosts([]); setFiltered([]); setChatHistory([]);
     try {
-      // 1. Start the run — returns immediately with runId + datasetId
       const startRes = await fetch("/api/start", {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-access-password": password },
@@ -73,10 +168,7 @@ export default function App() {
       if (startRes.status === 401) { setUnlocked(false); setPassword(""); localStorage.removeItem(ACCESS_PASSWORD_KEY); throw new Error("Senha incorreta"); }
       if (!startRes.ok) { const e = await startRes.json().catch(() => ({})); throw new Error(e.error || "Erro ao iniciar"); }
       const { runId, datasetId } = await startRes.json();
-
       setStatus("Scraper rodando... aguardando resultados");
-
-      // 2. Poll Apify directly from the browser for run status
       let attempts = 0;
       pollRef.current = setInterval(async () => {
         attempts++;
@@ -84,51 +176,70 @@ export default function App() {
           const pollRes = await fetch("https://api.apify.com/v2/actor-runs/" + runId);
           const { data } = await pollRes.json();
           const runStatus = data.status;
-
           if (runStatus === "SUCCEEDED") {
             clearInterval(pollRef.current);
             setStatus("Buscando resultados...");
-            // 3. Fetch results via our proxy (token stays server-side)
-            const resultsRes = await fetch("/api/results?datasetId=" + datasetId, {
-              headers: { "x-access-password": password },
-            });
+            const resultsRes = await fetch("/api/results?datasetId=" + datasetId, { headers: { "x-access-password": password } });
             if (!resultsRes.ok) { const e = await resultsRes.json().catch(() => ({})); throw new Error(e.error || "Erro ao buscar resultados"); }
             const items = await resultsRes.json();
-            setPosts(items);
-            setFiltered(items);
-            setStatus("");
-            setLoading(false);
+            setPosts(items); setFiltered(items); setStatus(""); setLoading(false);
             const entry = { handle, date: new Date().toISOString(), count: items.length };
             const updated = [entry, ...searches.slice(0, 9)];
             setSearches(updated);
             localStorage.setItem(SEARCHES_KEY, JSON.stringify(updated));
-          } else if (runStatus === "FAILED" || runStatus === "ABORTED" || runStatus === "TIMED-OUT") {
+          } else if (["FAILED","ABORTED","TIMED-OUT"].includes(runStatus)) {
             clearInterval(pollRef.current);
-            throw new Error("Run " + runStatus);
+            setError("Run " + runStatus); setStatus(""); setLoading(false);
           } else {
             setStatus("Scraper rodando... " + attempts * 5 + "s (" + runStatus + ")");
           }
         } catch (pollErr) {
-          if (pollErr.message.startsWith("Run ")) {
-            clearInterval(pollRef.current);
-            setError(pollErr.message);
-            setStatus("");
-            setLoading(false);
-          }
+          if (pollErr.message.startsWith("Run ")) { clearInterval(pollRef.current); setError(pollErr.message); setStatus(""); setLoading(false); }
         }
-        if (attempts >= 120) {
-          clearInterval(pollRef.current);
-          setError("Timeout: scraper demorou mais de 10 minutos");
-          setStatus("");
-          setLoading(false);
-        }
+        if (attempts >= 120) { clearInterval(pollRef.current); setError("Timeout"); setStatus(""); setLoading(false); }
       }, 5000);
+    } catch (err) { setError(err.message); setStatus(""); setLoading(false); }
+  }
 
+  async function handleAnalyze() {
+    if (!geminiKey) { setShowGeminiSetup(true); return; }
+    setAnalyzing(true);
+    setChatHistory([]);
+    try {
+      const result = await analyzeWithGemini(geminiKey, posts, handle);
+      setChatHistory([{ role: "assistant", text: result }]);
     } catch (err) {
-      setError(err.message);
-      setStatus("");
-      setLoading(false);
+      setChatHistory([{ role: "assistant", text: "Erro: " + err.message }]);
+    } finally {
+      setAnalyzing(false);
     }
+  }
+
+  async function handleChat(e) {
+    e.preventDefault();
+    if (!chatInput.trim() || chatLoading) return;
+    const userMsg = chatInput.trim();
+    setChatInput("");
+    const newHistory = [...chatHistory, { role: "user", text: userMsg }];
+    setChatHistory(newHistory);
+    setChatLoading(true);
+    try {
+      const reply = await chatWithGemini(geminiKey, newHistory, userMsg);
+      setChatHistory([...newHistory, { role: "assistant", text: reply }]);
+    } catch (err) {
+      setChatHistory([...newHistory, { role: "assistant", text: "Erro: " + err.message }]);
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  function saveGeminiKey(e) {
+    e.preventDefault();
+    if (!geminiKeyInput.trim()) return;
+    setGeminiKey(geminiKeyInput);
+    localStorage.setItem(GEMINI_KEY_KEY, geminiKeyInput);
+    setShowGeminiSetup(false);
+    setGeminiKeyInput("");
   }
 
   const totalLikes = filtered.reduce((s, p) => s + (p.likesCount || 0), 0);
@@ -145,6 +256,7 @@ export default function App() {
     input: { width: "100%", background: "#0f172a", border: "1px solid #334155", borderRadius: 8, padding: "8px 12px", color: "#e2e8f0", fontSize: 15, fontFamily: "inherit", boxSizing: "border-box" },
     btn: { background: "#f5a020", color: "#0f172a", border: "none", borderRadius: 8, padding: "10px 24px", fontWeight: 700, fontSize: 16, cursor: "pointer", fontFamily: "inherit" },
     btnSm: { background: "#1B2D5B", color: "#e2e8f0", border: "1px solid #334155", borderRadius: 6, padding: "6px 14px", fontSize: 13, cursor: "pointer", fontFamily: "inherit" },
+    btnAI: { background: "linear-gradient(135deg, #6366f1, #8b5cf6)", color: "#fff", border: "none", borderRadius: 8, padding: "10px 20px", fontWeight: 700, fontSize: 15, cursor: "pointer", fontFamily: "inherit" },
     grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 },
     grid4: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 20 },
     statCard: { background: "#1B2D5B", borderRadius: 10, padding: "14px 18px", textAlign: "center" },
@@ -158,6 +270,12 @@ export default function App() {
     statusBox: { background: "#1B2D5B", border: "1px solid #334155", borderRadius: 8, padding: "10px 16px", marginBottom: 16, color: "#94a3b8", display: "flex", alignItems: "center", gap: 10 },
     lockWrap: { minHeight: "100vh", background: "#0f172a", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Barlow Condensed', sans-serif" },
     lockCard: { background: "#1e2d4a", borderRadius: 16, padding: "40px 48px", width: "100%", maxWidth: 380, textAlign: "center" },
+    chatWrap: { background: "#1e2d4a", borderRadius: 12, padding: 0, marginBottom: 20, overflow: "hidden" },
+    chatHeader: { background: "#1B2D5B", padding: "12px 20px", display: "flex", alignItems: "center", gap: 10, borderBottom: "1px solid #334155" },
+    chatMessages: { padding: "16px 20px", maxHeight: 400, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 },
+    msgUser: { alignSelf: "flex-end", background: "#f5a020", color: "#0f172a", borderRadius: "12px 12px 2px 12px", padding: "8px 14px", maxWidth: "80%", fontSize: 14, fontWeight: 600 },
+    msgAI: { alignSelf: "flex-start", background: "#0f172a", color: "#e2e8f0", borderRadius: "12px 12px 12px 2px", padding: "10px 14px", maxWidth: "85%", fontSize: 14, lineHeight: 1.5, whiteSpace: "pre-wrap" },
+    chatInputWrap: { display: "flex", gap: 8, padding: "12px 16px", borderTop: "1px solid #334155" },
   };
 
   if (!unlocked) {
@@ -217,14 +335,27 @@ export default function App() {
         </form>
       </div>
 
-      {status && (
-        <div style={st.statusBox}>
-          <span style={{ fontSize: 18 }}>⏳</span>
-          <span>{status}</span>
+      {status && <div style={st.statusBox}><span style={{ fontSize: 18 }}>⏳</span><span>{status}</span></div>}
+      {error && <div style={st.errorBox}>{error}</div>}
+
+      {/* Gemini Key Setup Modal */}
+      {showGeminiSetup && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+          <div style={{ background: "#1e2d4a", borderRadius: 16, padding: "32px", width: "90%", maxWidth: 400 }}>
+            <div style={{ fontSize: 20, fontWeight: 700, color: "#f5a020", marginBottom: 8 }}>Gemini API Key</div>
+            <div style={{ fontSize: 13, color: "#64748b", marginBottom: 20 }}>
+              Grátis em <a href="https://aistudio.google.com" target="_blank" rel="noreferrer" style={{ color: "#6366f1" }}>aistudio.google.com</a> → Get API Key
+            </div>
+            <form onSubmit={saveGeminiKey}>
+              <input style={{ ...st.input, marginBottom: 12 }} placeholder="AIza..." value={geminiKeyInput} onChange={(e) => setGeminiKeyInput(e.target.value)} autoFocus />
+              <div style={{ display: "flex", gap: 8 }}>
+                <button type="submit" style={{ ...st.btn, flex: 1 }}>Salvar</button>
+                <button type="button" style={{ ...st.btnSm, flex: 1 }} onClick={() => setShowGeminiSetup(false)}>Cancelar</button>
+              </div>
+            </form>
+          </div>
         </div>
       )}
-
-      {error && <div style={st.errorBox}>{error}</div>}
 
       {posts.length > 0 && (
         <>
@@ -234,10 +365,53 @@ export default function App() {
             <div style={st.statCard}><div style={st.statVal}>{fmt(avgLikes)}</div><div style={st.statLbl}>Media likes</div></div>
             <div style={st.statCard}><div style={st.statVal}>{fmt(avgComments)}</div><div style={st.statLbl}>Media comentarios</div></div>
           </div>
-          <div style={{ display: "flex", gap: 10, marginBottom: 16, alignItems: "center" }}>
-            <input style={{ ...st.input, maxWidth: 280 }} placeholder="Filtrar por keyword..." value={keyword} onChange={(e) => setKeyword(e.target.value)} />
+
+          <div style={{ display: "flex", gap: 10, marginBottom: 16, alignItems: "center", flexWrap: "wrap" }}>
+            <input style={{ ...st.input, maxWidth: 240 }} placeholder="Filtrar por keyword..." value={keyword} onChange={(e) => setKeyword(e.target.value)} />
             <button style={st.btnSm} onClick={() => exportCSV(filtered, handle)}>Exportar CSV</button>
+            <button style={{ ...st.btnAI, opacity: analyzing ? 0.6 : 1 }} onClick={handleAnalyze} disabled={analyzing}>
+              {analyzing ? "Analisando..." : "✨ Analisar com AI"}
+            </button>
+            {geminiKey && <button style={{ ...st.btnSm, fontSize: 11 }} onClick={() => { setGeminiKey(""); localStorage.removeItem(GEMINI_KEY_KEY); }}>Trocar key</button>}
           </div>
+
+          {/* AI Chat */}
+          {(chatHistory.length > 0 || analyzing) && (
+            <div style={st.chatWrap}>
+              <div style={st.chatHeader}>
+                <span style={{ fontSize: 18 }}>✨</span>
+                <span style={{ fontWeight: 700, color: "#e2e8f0" }}>AI Assistant</span>
+                <span style={{ fontSize: 12, color: "#64748b", marginLeft: 4 }}>@{handle} · {posts.length} posts</span>
+              </div>
+              <div style={st.chatMessages}>
+                {analyzing && (
+                  <div style={st.msgAI}>
+                    <span style={{ opacity: 0.6 }}>Analisando {posts.length} posts e imagens... isso pode levar 30-60s ⏳</span>
+                  </div>
+                )}
+                {chatHistory.map((m, i) => (
+                  <div key={i} style={m.role === "user" ? st.msgUser : st.msgAI}>{m.text}</div>
+                ))}
+                {chatLoading && <div style={st.msgAI}><span style={{ opacity: 0.6 }}>Pensando...</span></div>}
+                <div ref={chatBottomRef} />
+              </div>
+              {chatHistory.length > 0 && (
+                <form onSubmit={handleChat} style={st.chatInputWrap}>
+                  <input
+                    style={{ ...st.input, flex: 1 }}
+                    placeholder="Pergunte qualquer coisa sobre os posts..."
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    disabled={chatLoading || analyzing}
+                  />
+                  <button type="submit" style={{ ...st.btn, padding: "8px 16px", fontSize: 14 }} disabled={chatLoading || analyzing}>
+                    Enviar
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
+
           <div style={st.postGrid}>
             {filtered.map((p, i) => {
               const postUrl = p.url || (p.shortCode && "https://www.instagram.com/p/" + p.shortCode + "/");
