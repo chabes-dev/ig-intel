@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 
 const SEARCHES_KEY = "ig_intel_searches";
 const ACCESS_PASSWORD_KEY = "ig_intel_password";
@@ -6,20 +6,6 @@ const fmt = (n) => n?.toLocaleString("pt-BR") ?? "-";
 const fmtDate = (iso) => iso ? new Date(iso).toLocaleDateString("pt-BR") : "-";
 const typeLabel = { Image: "Foto", Video: "Video", Sidecar: "Carrossel" };
 const typeColor = { Image: "#3b82f6", Video: "#f5a020", Sidecar: "#10b981" };
-
-async function runScrape(password, handle, maxPosts, dateFrom, dateTo) {
-  const res = await fetch("/api/scrape", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-access-password": password },
-    body: JSON.stringify({ handle, maxPosts, dateFrom, dateTo }),
-  });
-  if (res.status === 401) throw new Error("Senha incorreta");
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || "Erro ao buscar dados");
-  }
-  return res.json();
-}
 
 function exportCSV(posts, handle) {
   const headers = ["url","type","timestamp","likes","comments","caption"];
@@ -45,20 +31,22 @@ export default function App() {
   const [dateTo, setDateTo] = useState("");
   const [keyword, setKeyword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [posts, setPosts] = useState([]);
   const [filtered, setFiltered] = useState([]);
   const [searches, setSearches] = useState(() => { try { return JSON.parse(localStorage.getItem(SEARCHES_KEY) || "[]"); } catch { return []; } });
+  const pollRef = useRef(null);
 
-  useEffect(() => {
-    if (password) setUnlocked(true);
-  }, []);
+  useEffect(() => { if (password) setUnlocked(true); }, []);
 
   useEffect(() => {
     if (!keyword.trim()) { setFiltered(posts); return; }
     const kw = keyword.toLowerCase();
     setFiltered(posts.filter((p) => (p.caption || "").toLowerCase().includes(kw)));
   }, [keyword, posts]);
+
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
   function handleUnlock(e) {
     e.preventDefault();
@@ -72,23 +60,73 @@ export default function App() {
   async function handleSearch(e) {
     e.preventDefault();
     if (!handle) return;
-    setLoading(true); setError(""); setPosts([]); setFiltered([]);
+    if (pollRef.current) clearInterval(pollRef.current);
+    setLoading(true); setError(""); setStatus("Iniciando scraper..."); setPosts([]); setFiltered([]);
+
     try {
-      const data = await runScrape(password, handle, maxPosts, dateFrom, dateTo);
-      setPosts(data);
-      setFiltered(data);
-      const entry = { handle, date: new Date().toISOString(), count: data.length };
-      const updated = [entry, ...searches.slice(0, 9)];
-      setSearches(updated);
-      localStorage.setItem(SEARCHES_KEY, JSON.stringify(updated));
+      // 1. Start the run — returns immediately with runId + datasetId
+      const startRes = await fetch("/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-access-password": password },
+        body: JSON.stringify({ handle, maxPosts, dateFrom, dateTo }),
+      });
+      if (startRes.status === 401) { setUnlocked(false); setPassword(""); localStorage.removeItem(ACCESS_PASSWORD_KEY); throw new Error("Senha incorreta"); }
+      if (!startRes.ok) { const e = await startRes.json().catch(() => ({})); throw new Error(e.error || "Erro ao iniciar"); }
+      const { runId, datasetId } = await startRes.json();
+
+      setStatus("Scraper rodando... aguardando resultados");
+
+      // 2. Poll Apify directly from the browser for run status
+      let attempts = 0;
+      pollRef.current = setInterval(async () => {
+        attempts++;
+        try {
+          const pollRes = await fetch("https://api.apify.com/v2/actor-runs/" + runId);
+          const { data } = await pollRes.json();
+          const runStatus = data.status;
+
+          if (runStatus === "SUCCEEDED") {
+            clearInterval(pollRef.current);
+            setStatus("Buscando resultados...");
+            // 3. Fetch results via our proxy (token stays server-side)
+            const resultsRes = await fetch("/api/results?datasetId=" + datasetId, {
+              headers: { "x-access-password": password },
+            });
+            if (!resultsRes.ok) { const e = await resultsRes.json().catch(() => ({})); throw new Error(e.error || "Erro ao buscar resultados"); }
+            const items = await resultsRes.json();
+            setPosts(items);
+            setFiltered(items);
+            setStatus("");
+            setLoading(false);
+            const entry = { handle, date: new Date().toISOString(), count: items.length };
+            const updated = [entry, ...searches.slice(0, 9)];
+            setSearches(updated);
+            localStorage.setItem(SEARCHES_KEY, JSON.stringify(updated));
+          } else if (runStatus === "FAILED" || runStatus === "ABORTED" || runStatus === "TIMED-OUT") {
+            clearInterval(pollRef.current);
+            throw new Error("Run " + runStatus);
+          } else {
+            setStatus("Scraper rodando... " + attempts * 5 + "s (" + runStatus + ")");
+          }
+        } catch (pollErr) {
+          if (pollErr.message.startsWith("Run ")) {
+            clearInterval(pollRef.current);
+            setError(pollErr.message);
+            setStatus("");
+            setLoading(false);
+          }
+        }
+        if (attempts >= 120) {
+          clearInterval(pollRef.current);
+          setError("Timeout: scraper demorou mais de 10 minutos");
+          setStatus("");
+          setLoading(false);
+        }
+      }, 5000);
+
     } catch (err) {
-      if (err.message === "Senha incorreta") {
-        setUnlocked(false);
-        setPassword("");
-        localStorage.removeItem(ACCESS_PASSWORD_KEY);
-      }
       setError(err.message);
-    } finally {
+      setStatus("");
       setLoading(false);
     }
   }
@@ -99,7 +137,7 @@ export default function App() {
   const avgComments = filtered.length ? Math.round(totalComments / filtered.length) : 0;
 
   const st = {
-    app: { minHeight: "100vh", background: "#0f172a", color: "#e2e8f0", fontFamily: "'Barlow Condensed', sans-serif", padding: "24px", display: "flex", flexDirection: "column", alignItems: unlocked ? "stretch" : "center", justifyContent: unlocked ? "flex-start" : "center" },
+    app: { minHeight: "100vh", background: "#0f172a", color: "#e2e8f0", fontFamily: "'Barlow Condensed', sans-serif", padding: "24px" },
     header: { display: "flex", alignItems: "center", gap: 12, marginBottom: 24 },
     logo: { fontSize: 28, fontWeight: 700, color: "#f5a020", letterSpacing: 1 },
     card: { background: "#1e2d4a", borderRadius: 12, padding: "20px 24px", marginBottom: 20 },
@@ -117,12 +155,14 @@ export default function App() {
     thumb: { width: "100%", aspectRatio: "1", objectFit: "cover", background: "#0f172a" },
     tag: { display: "inline-block", borderRadius: 4, padding: "2px 8px", fontSize: 11, fontWeight: 700, marginBottom: 6 },
     errorBox: { background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 8, padding: "10px 16px", marginBottom: 16, color: "#fca5a5" },
+    statusBox: { background: "#1B2D5B", border: "1px solid #334155", borderRadius: 8, padding: "10px 16px", marginBottom: 16, color: "#94a3b8", display: "flex", alignItems: "center", gap: 10 },
+    lockWrap: { minHeight: "100vh", background: "#0f172a", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Barlow Condensed', sans-serif" },
     lockCard: { background: "#1e2d4a", borderRadius: 16, padding: "40px 48px", width: "100%", maxWidth: 380, textAlign: "center" },
   };
 
   if (!unlocked) {
     return (
-      <div style={st.app}>
+      <div style={st.lockWrap}>
         <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700&display=swap" rel="stylesheet" />
         <div style={st.lockCard}>
           <div style={{ ...st.logo, fontSize: 36, marginBottom: 8 }}>IG Intel</div>
@@ -131,7 +171,7 @@ export default function App() {
           <form onSubmit={handleUnlock}>
             <div style={{ marginBottom: 16 }}>
               <label style={st.label}>Senha de acesso</label>
-              <input style={st.input} type="password" placeholder="••••••••" value={passwordInput} onChange={(e) => setPasswordInput(e.target.value)} autoFocus />
+              <input style={st.input} type="password" placeholder="..." value={passwordInput} onChange={(e) => setPasswordInput(e.target.value)} autoFocus />
             </div>
             <button type="submit" style={{ ...st.btn, width: "100%" }}>Entrar</button>
           </form>
@@ -141,12 +181,12 @@ export default function App() {
   }
 
   return (
-    <div style={{ ...st.app, alignItems: "stretch", justifyContent: "flex-start" }}>
+    <div style={st.app}>
       <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700&display=swap" rel="stylesheet" />
       <div style={st.header}>
         <span style={st.logo}>IG Intel</span>
         <span style={{ color: "#475569", fontSize: 13 }}>Instagram Analytics</span>
-        <button style={{ ...st.btnSm, marginLeft: "auto", fontSize: 12 }} onClick={() => { setUnlocked(false); setPassword(""); localStorage.removeItem(ACCESS_PASSWORD_KEY); }}>Sair</button>
+        <button style={{ ...st.btnSm, marginLeft: "auto" }} onClick={() => { setUnlocked(false); setPassword(""); localStorage.removeItem(ACCESS_PASSWORD_KEY); }}>Sair</button>
       </div>
 
       <div style={st.card}>
@@ -171,11 +211,18 @@ export default function App() {
               <input style={st.input} type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
             </div>
           </div>
-          <button type="submit" style={st.btn} disabled={loading}>
+          <button type="submit" style={{ ...st.btn, opacity: loading ? 0.6 : 1 }} disabled={loading}>
             {loading ? "Buscando..." : "Buscar"}
           </button>
         </form>
       </div>
+
+      {status && (
+        <div style={st.statusBox}>
+          <span style={{ fontSize: 18 }}>⏳</span>
+          <span>{status}</span>
+        </div>
+      )}
 
       {error && <div style={st.errorBox}>{error}</div>}
 
@@ -187,22 +234,16 @@ export default function App() {
             <div style={st.statCard}><div style={st.statVal}>{fmt(avgLikes)}</div><div style={st.statLbl}>Media likes</div></div>
             <div style={st.statCard}><div style={st.statVal}>{fmt(avgComments)}</div><div style={st.statLbl}>Media comentarios</div></div>
           </div>
-
           <div style={{ display: "flex", gap: 10, marginBottom: 16, alignItems: "center" }}>
             <input style={{ ...st.input, maxWidth: 280 }} placeholder="Filtrar por keyword..." value={keyword} onChange={(e) => setKeyword(e.target.value)} />
             <button style={st.btnSm} onClick={() => exportCSV(filtered, handle)}>Exportar CSV</button>
           </div>
-
           <div style={st.postGrid}>
             {filtered.map((p, i) => {
               const postUrl = p.url || (p.shortCode && "https://www.instagram.com/p/" + p.shortCode + "/");
               return (
                 <div key={i} style={st.postCard} onClick={() => postUrl && window.open(postUrl, "_blank")}>
-                  {p.displayUrl ? (
-                    <img src={p.displayUrl} alt="" style={st.thumb} loading="lazy" />
-                  ) : (
-                    <div style={{ ...st.thumb, display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: 12 }}>sem thumb</div>
-                  )}
+                  {p.displayUrl ? <img src={p.displayUrl} alt="" style={st.thumb} loading="lazy" /> : <div style={{ ...st.thumb, display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: 12 }}>sem thumb</div>}
                   <div style={{ padding: "10px 12px" }}>
                     <span style={{ ...st.tag, background: typeColor[p.type] || "#475569", color: "#fff" }}>{typeLabel[p.type] || p.type}</span>
                     <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 4 }}>{fmtDate(p.timestamp)}</div>
@@ -219,7 +260,7 @@ export default function App() {
         </>
       )}
 
-      {searches.length > 0 && posts.length === 0 && (
+      {searches.length > 0 && posts.length === 0 && !loading && (
         <div style={st.card}>
           <div style={{ fontSize: 13, color: "#64748b", marginBottom: 8 }}>Buscas recentes</div>
           {searches.map((s2, i) => (
