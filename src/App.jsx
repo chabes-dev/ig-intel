@@ -243,7 +243,7 @@ export default function App() {
               const postUrl = p.url || (p.shortCode && "https://www.instagram.com/p/" + p.shortCode + "/");
               return (
                 <div key={i} style={st.postCard} onClick={() => postUrl && window.open(postUrl, "_blank")}>
-                  {p.displayUrl ? <img src={p.displayUrl} alt="" style={st.thumb} loading="lazy" /> : <div style={{ ...st.thumb, display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: 12 }}>sem thumb</div>}
+                  {p.displayUrl ? <img src={"/api/img?url=" + encodeURIComponent(p.displayUrl)} alt="" style={st.thumb} loading="lazy" /> : <div style={{ ...st.thumb, display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: 12 }}>sem thumb</div>}
                   <div style={{ padding: "10px 12px" }}>
                     <span style={{ ...st.tag, background: typeColor[p.type] || "#475569", color: "#fff" }}>{typeLabel[p.type] || p.type}</span>
                     <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 4 }}>{fmtDate(p.timestamp)}</div>
