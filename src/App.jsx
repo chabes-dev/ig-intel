@@ -30,7 +30,7 @@ async function callGemini(password, contents) {
   if (res.status === 401) throw new Error("Senha incorreta");
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || "Gemini error"); }
   const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "Sem resposta";
+  return data.text || "Sem resposta";
 }
 
 async function analyzeWithGemini(password, posts, handle) {
