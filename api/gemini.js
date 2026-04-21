@@ -10,24 +10,35 @@ export default async function handler(req, res) {
   const password = req.headers["x-access-password"];
   if (password !== ACCESS_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
 
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (!geminiKey) return res.status(500).json({ error: "GEMINI_API_KEY not configured" });
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) return res.status(500).json({ error: "GROQ_API_KEY not configured" });
 
   const { contents } = req.body;
   if (!contents) return res.status(400).json({ error: "contents required" });
 
+  const messages = contents.map(c => ({
+    role: c.role === "model" ? "assistant" : "user",
+    content: c.parts.map(p => p.text || "").join(""),
+  }));
+
   try {
-    const r = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + geminiKey,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents }),
-      }
-    );
+    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + groqKey,
+      },
+      body: JSON.stringify({
+        model: "llama-3.1-8b-instant",
+        messages,
+        max_tokens: 2048,
+      }),
+    });
     const data = await r.json();
-    if (!r.ok) throw new Error(data?.error?.message || "Gemini error " + r.status);
-    return res.status(200).json(data);
+    if (!r.ok) throw new Error(data?.error?.message || "Groq error " + r.status);
+    return res.status(200).json({
+      candidates: [{ content: { parts: [{ text: data.choices[0].message.content }] } }]
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
