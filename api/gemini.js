@@ -1,4 +1,22 @@
 const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || "igintel2024";
+const GEMINI_MODEL = "gemini-2.5-flash";
+const BASE_URL = process.env.VERCEL_URL
+  ? `https://${process.env.VERCEL_URL}`
+  : "https://ig-intel-five.vercel.app";
+
+async function fetchImageAsBase64(thumbnailUrl) {
+  try {
+    const proxied = `${BASE_URL}/api/img?url=${encodeURIComponent(thumbnailUrl)}`;
+    const r = await fetch(proxied, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return null;
+    const buf = await r.arrayBuffer();
+    const b64 = Buffer.from(buf).toString("base64");
+    const ct = r.headers.get("content-type") || "image/jpeg";
+    return { b64, mimeType: ct.split(";")[0] };
+  } catch {
+    return null;
+  }
+}
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -16,30 +34,40 @@ export default async function handler(req, res) {
   const { contents } = req.body;
   if (!contents) return res.status(400).json({ error: "contents required" });
 
-  // Build Gemini-format messages, including inline images where available
-  const geminiContents = contents.map(c => {
+  // Thumbnail URL pattern in text parts (Apify fields)
+  const thumbPattern = /https?:\/\/[^\s"]+(?:cdninstagram|fbcdn)[^\s"]+/g;
+
+  const geminiContents = await Promise.all(contents.map(async (c) => {
     if (c.role === "model") {
       return { role: "model", parts: [{ text: c.parts.map(p => p.text || "").join("") }] };
     }
-    // User turn: attach image parts for posts that have thumbnails
+
+    // Build parts, injecting images inline before each post text
     const parts = [];
-    c.parts.forEach(p => {
-      if (p.text) parts.push({ text: p.text });
-      if (p.imageUrl) {
-        // Pass as image URL via inline_data is not supported — use fileData or just describe
-        // We'll include the URL as context text since Gemini Flash accepts URLs in newer API
-        parts.push({ text: "[image: " + p.imageUrl + "]" });
+    for (const p of c.parts) {
+      const text = p.text || "";
+      const urls = [...new Set(text.match(thumbPattern) || [])];
+
+      // Fetch up to 5 images per turn (cap to control token usage)
+      const imageResults = await Promise.all(
+        urls.slice(0, 5).map(url => fetchImageAsBase64(url))
+      );
+
+      for (const img of imageResults) {
+        if (img) {
+          parts.push({ inlineData: { mimeType: img.mimeType, data: img.b64 } });
+        }
       }
-      if (p.inlineImage) {
-        parts.push({ inlineData: { mimeType: p.mimeType || "image/jpeg", data: p.inlineImage } });
-      }
-    });
-    return { role: "user", parts };
-  });
+
+      if (text) parts.push({ text });
+    }
+
+    return { role: "user", parts: parts.length ? parts : [{ text: "" }] };
+  }));
 
   try {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key=${geminiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -51,7 +79,6 @@ export default async function handler(req, res) {
     );
 
     const data = await response.json();
-
     if (!response.ok) {
       return res.status(500).json({ error: data.error?.message || "Gemini API error" });
     }
