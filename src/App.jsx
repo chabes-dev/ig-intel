@@ -27,12 +27,13 @@ async function callGemini(password, contents) {
     headers: { "Content-Type": "application/json", "x-access-password": password },
     body: JSON.stringify({ contents }),
   });
+  if (res.status === 401) throw new Error("Senha incorreta");
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || "Gemini error"); }
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Gemini error");
   return data.candidates?.[0]?.content?.parts?.[0]?.text || "Sem resposta";
 }
 
-async function buildAnalysisContents(posts, handle) {
+async function analyzeWithGemini(password, posts, handle) {
   const postsData = posts.slice(0, 50).map((p, i) => ({
     index: i + 1,
     type: p.type,
@@ -43,33 +44,37 @@ async function buildAnalysisContents(posts, handle) {
     imageUrl: p.displayUrl || null,
   }));
 
-  const parts = [];
+  const imageParts = [];
+  for (const p of postsData) {
+    if (p.imageUrl) {
+      try {
+        const r = await fetch("/api/img?url=" + encodeURIComponent(p.imageUrl));
+        if (r.ok) {
+          const blob = await r.blob();
+          const b64 = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result.split(",")[1]);
+            reader.readAsDataURL(blob);
+          });
+          imageParts.push({ index: p.index, b64, mimeType: blob.type || "image/jpeg" });
+        }
+      } catch {}
+    }
+  }
+
   const textSummary = postsData.map(p =>
     `[Post ${p.index}] ${p.type} | ${p.date} | Likes: ${p.likes} | Comments: ${p.comments}\nCaption: ${p.caption}`
   ).join("\n\n");
 
-  parts.push({
-    text: `Você é um assistente especialista em análise de Instagram. Analise os ${postsData.length} posts do perfil @${handle}.\n\nDADOS:\n${textSummary}\n\nIMAGENS abaixo. Para cada imagem identifique: subjects, tipo de conteúdo, produtos, tom visual, texto presente.\n\nAo final responda: "Análise concluída! Tenho ${postsData.length} posts em contexto. Pergunte o que quiser sobre @${handle}."`
-  });
-
-  // Fetch images via proxy and encode as base64
-  for (const p of postsData) {
-    if (!p.imageUrl) continue;
-    try {
-      const r = await fetch("/api/img?url=" + encodeURIComponent(p.imageUrl));
-      if (!r.ok) continue;
-      const blob = await r.blob();
-      const b64 = await new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result.split(",")[1]);
-        reader.readAsDataURL(blob);
-      });
-      parts.push({ text: `[Post ${p.index} - ${p.date} - Likes:${p.likes}]:` });
-      parts.push({ inlineData: { mimeType: blob.type || "image/jpeg", data: b64 } });
-    } catch {}
+  const parts = [{
+    text: `Voce e um assistente especialista em analise de Instagram. Analise os ${postsData.length} posts do perfil @${handle} abaixo.\n\nDADOS DOS POSTS:\n${textSummary}\n\nIMAGENS (${imageParts.length} disponíveis abaixo):\nAnalise cada imagem junto com seus metadados. Identifique: subjects principais, tipo de conteudo, produtos mostrados, tom visual, texto presente, etc.\n\nApos analisar tudo, responda: "Analise concluida! Tenho ${postsData.length} posts em contexto. Pode me perguntar qualquer coisa sobre o perfil @${handle}."`
+  }];
+  for (const img of imageParts) {
+    parts.push({ text: `\n[Imagem do Post ${img.index}]:` });
+    parts.push({ inlineData: { mimeType: img.mimeType, data: img.b64 } });
   }
 
-  return [{ parts }];
+  return callGemini(password, [{ parts }]);
 }
 
 export default function App() {
@@ -90,7 +95,6 @@ export default function App() {
   const pollRef = useRef(null);
 
   const [analyzing, setAnalyzing] = useState(false);
-  const [analysisContents, setAnalysisContents] = useState(null);
   const [chatHistory, setChatHistory] = useState([]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -118,7 +122,7 @@ export default function App() {
     e.preventDefault();
     if (!handle) return;
     if (pollRef.current) clearInterval(pollRef.current);
-    setLoading(true); setError(""); setStatus("Iniciando scraper..."); setPosts([]); setFiltered([]); setChatHistory([]); setAnalysisContents(null);
+    setLoading(true); setError(""); setStatus("Iniciando scraper..."); setPosts([]); setFiltered([]); setChatHistory([]);
     try {
       const startRes = await fetch("/api/start", {
         method: "POST",
@@ -128,7 +132,7 @@ export default function App() {
       if (startRes.status === 401) { setUnlocked(false); setPassword(""); localStorage.removeItem(ACCESS_PASSWORD_KEY); throw new Error("Senha incorreta"); }
       if (!startRes.ok) { const e = await startRes.json().catch(() => ({})); throw new Error(e.error || "Erro ao iniciar"); }
       const { runId, datasetId } = await startRes.json();
-      setStatus("Scraper rodando...");
+      setStatus("Scraper rodando... aguardando resultados");
       let attempts = 0;
       pollRef.current = setInterval(async () => {
         attempts++;
@@ -140,7 +144,7 @@ export default function App() {
             clearInterval(pollRef.current);
             setStatus("Buscando resultados...");
             const resultsRes = await fetch("/api/results?datasetId=" + datasetId, { headers: { "x-access-password": password } });
-            if (!resultsRes.ok) { const e = await resultsRes.json().catch(() => ({})); throw new Error(e.error || "Erro"); }
+            if (!resultsRes.ok) { const e = await resultsRes.json().catch(() => ({})); throw new Error(e.error || "Erro ao buscar resultados"); }
             const items = await resultsRes.json();
             setPosts(items); setFiltered(items); setStatus(""); setLoading(false);
             const entry = { handle, date: new Date().toISOString(), count: items.length };
@@ -162,18 +166,13 @@ export default function App() {
   }
 
   async function handleAnalyze() {
-    setAnalyzing(true);
-    setChatHistory([]);
+    setAnalyzing(true); setChatHistory([]);
     try {
-      const contents = await buildAnalysisContents(posts, handle);
-      setAnalysisContents(contents);
-      const reply = await callGemini(password, contents);
-      setChatHistory([{ role: "assistant", text: reply }]);
+      const result = await analyzeWithGemini(password, posts, handle);
+      setChatHistory([{ role: "assistant", text: result }]);
     } catch (err) {
       setChatHistory([{ role: "assistant", text: "Erro: " + err.message }]);
-    } finally {
-      setAnalyzing(false);
-    }
+    } finally { setAnalyzing(false); }
   }
 
   async function handleChat(e) {
@@ -185,22 +184,15 @@ export default function App() {
     setChatHistory(newHistory);
     setChatLoading(true);
     try {
-      // Build full conversation contents
-      const baseContents = analysisContents || [];
-      const conversationContents = [
-        ...baseContents,
-        ...newHistory.map(m => ({
-          role: m.role === "assistant" ? "model" : "user",
-          parts: [{ text: m.text }],
-        })),
-      ];
-      const reply = await callGemini(password, conversationContents);
+      const contents = newHistory.map(m => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.text }],
+      }));
+      const reply = await callGemini(password, contents);
       setChatHistory([...newHistory, { role: "assistant", text: reply }]);
     } catch (err) {
       setChatHistory([...newHistory, { role: "assistant", text: "Erro: " + err.message }]);
-    } finally {
-      setChatLoading(false);
-    }
+    } finally { setChatLoading(false); }
   }
 
   const totalLikes = filtered.reduce((s, p) => s + (p.likesCount || 0), 0);
@@ -271,28 +263,14 @@ export default function App() {
       <div style={st.card}>
         <form onSubmit={handleSearch}>
           <div style={{ ...st.grid2, marginBottom: 14 }}>
-            <div>
-              <label style={st.label}>@handle</label>
-              <input style={st.input} placeholder="@username" value={handle} onChange={(e) => setHandle(e.target.value)} />
-            </div>
-            <div>
-              <label style={st.label}>Max posts</label>
-              <input style={st.input} type="number" min={1} max={500} value={maxPosts} onChange={(e) => setMaxPosts(+e.target.value)} />
-            </div>
+            <div><label style={st.label}>@handle</label><input style={st.input} placeholder="@username" value={handle} onChange={(e) => setHandle(e.target.value)} /></div>
+            <div><label style={st.label}>Max posts</label><input style={st.input} type="number" min={1} max={500} value={maxPosts} onChange={(e) => setMaxPosts(+e.target.value)} /></div>
           </div>
           <div style={{ ...st.grid2, marginBottom: 14 }}>
-            <div>
-              <label style={st.label}>De (data)</label>
-              <input style={st.input} type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
-            </div>
-            <div>
-              <label style={st.label}>Ate (data)</label>
-              <input style={st.input} type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
-            </div>
+            <div><label style={st.label}>De (data)</label><input style={st.input} type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} /></div>
+            <div><label style={st.label}>Ate (data)</label><input style={st.input} type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} /></div>
           </div>
-          <button type="submit" style={{ ...st.btn, opacity: loading ? 0.6 : 1 }} disabled={loading}>
-            {loading ? "Buscando..." : "Buscar"}
-          </button>
+          <button type="submit" style={{ ...st.btn, opacity: loading ? 0.6 : 1 }} disabled={loading}>{loading ? "Buscando..." : "Buscar"}</button>
         </form>
       </div>
 
@@ -324,7 +302,7 @@ export default function App() {
                 <span style={{ fontSize: 12, color: "#64748b", marginLeft: 4 }}>@{handle} · {posts.length} posts</span>
               </div>
               <div style={st.chatMessages}>
-                {analyzing && <div style={st.msgAI}><span style={{ opacity: 0.6 }}>Analisando {posts.length} posts e imagens... aguarde ⏳</span></div>}
+                {analyzing && <div style={st.msgAI}><span style={{ opacity: 0.6 }}>Analisando {posts.length} posts e imagens... isso pode levar 30-60s ⏳</span></div>}
                 {chatHistory.map((m, i) => (
                   <div key={i} style={m.role === "user" ? st.msgUser : st.msgAI}>{m.text}</div>
                 ))}
@@ -349,10 +327,7 @@ export default function App() {
                   <div style={{ padding: "10px 12px" }}>
                     <span style={{ ...st.tag, background: typeColor[p.type] || "#475569", color: "#fff" }}>{typeLabel[p.type] || p.type}</span>
                     <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 4 }}>{fmtDate(p.timestamp)}</div>
-                    <div style={{ display: "flex", gap: 10, fontSize: 13, color: "#cbd5e1" }}>
-                      <span>Likes {fmt(p.likesCount)}</span>
-                      <span>Com {fmt(p.commentsCount)}</span>
-                    </div>
+                    <div style={{ display: "flex", gap: 10, fontSize: 13, color: "#cbd5e1" }}><span>Likes {fmt(p.likesCount)}</span><span>Com {fmt(p.commentsCount)}</span></div>
                     {p.caption && <div style={{ fontSize: 12, color: "#64748b", marginTop: 6, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{p.caption}</div>}
                   </div>
                 </div>
