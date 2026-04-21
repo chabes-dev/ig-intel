@@ -10,35 +10,54 @@ export default async function handler(req, res) {
   const password = req.headers["x-access-password"];
   if (password !== ACCESS_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
 
-  const groqKey = process.env.GROQ_API_KEY;
-  if (!groqKey) return res.status(500).json({ error: "GROQ_API_KEY not configured" });
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) return res.status(500).json({ error: "GEMINI_API_KEY not configured" });
 
   const { contents } = req.body;
   if (!contents) return res.status(400).json({ error: "contents required" });
 
-  const messages = contents.map(c => ({
-    role: c.role === "model" ? "assistant" : "user",
-    content: c.parts.map(p => p.text || "").join(""),
-  }));
+  // Build Gemini-format messages, including inline images where available
+  const geminiContents = contents.map(c => {
+    if (c.role === "model") {
+      return { role: "model", parts: [{ text: c.parts.map(p => p.text || "").join("") }] };
+    }
+    // User turn: attach image parts for posts that have thumbnails
+    const parts = [];
+    c.parts.forEach(p => {
+      if (p.text) parts.push({ text: p.text });
+      if (p.imageUrl) {
+        // Pass as image URL via inline_data is not supported — use fileData or just describe
+        // We'll include the URL as context text since Gemini Flash accepts URLs in newer API
+        parts.push({ text: "[image: " + p.imageUrl + "]" });
+      }
+      if (p.inlineImage) {
+        parts.push({ inlineData: { mimeType: p.mimeType || "image/jpeg", data: p.inlineImage } });
+      }
+    });
+    return { role: "user", parts };
+  });
 
   try {
-    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + groqKey,
-      },
-      body: JSON.stringify({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
-        messages,
-        max_tokens: 2048,
-      }),
-    });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data?.error?.message || "Groq error " + r.status);
-    return res.status(200).json({
-      candidates: [{ content: { parts: [{ text: data.choices[0].message.content }] } }]
-    });
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key=${geminiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: geminiContents,
+          generationConfig: { maxOutputTokens: 1500, temperature: 0.7 }
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      return res.status(500).json({ error: data.error?.message || "Gemini API error" });
+    }
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "No response";
+    return res.status(200).json({ text });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
