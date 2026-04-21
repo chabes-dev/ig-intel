@@ -40,39 +40,18 @@ async function analyzeWithGemini(password, posts, handle) {
     date: p.timestamp ? new Date(p.timestamp).toLocaleDateString("pt-BR") : "?",
     likes: p.likesCount || 0,
     comments: p.commentsCount || 0,
-    caption: (p.caption || "").slice(0, 300),
-    imageUrl: p.displayUrl || null,
+    caption: (p.caption || "").slice(0, 400),
+    url: p.url || (p.shortCode && "https://www.instagram.com/p/" + p.shortCode + "/") || "",
+    imageUrl: p.displayUrl || "",
   }));
 
-  const imageParts = [];
-  for (const p of postsData) {
-    if (p.imageUrl) {
-      try {
-        const r = await fetch("/api/img?url=" + encodeURIComponent(p.imageUrl));
-        if (r.ok) {
-          const blob = await r.blob();
-          const b64 = await new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result.split(",")[1]);
-            reader.readAsDataURL(blob);
-          });
-          imageParts.push({ index: p.index, b64, mimeType: blob.type || "image/jpeg" });
-        }
-      } catch {}
-    }
-  }
-
   const textSummary = postsData.map(p =>
-    `[Post ${p.index}] ${p.type} | ${p.date} | Likes: ${p.likes} | Comments: ${p.comments}\nCaption: ${p.caption}`
+    `[Post ${p.index}] Tipo: ${p.type} | Data: ${p.date} | Likes: ${p.likes} | Comentarios: ${p.comments} | URL imagem: ${p.imageUrl}\nCaption: ${p.caption}`
   ).join("\n\n");
 
   const parts = [{
-    text: `Voce e um assistente especialista em analise de Instagram. Analise os ${postsData.length} posts do perfil @${handle} abaixo.\n\nDADOS DOS POSTS:\n${textSummary}\n\nIMAGENS (${imageParts.length} disponíveis abaixo):\nAnalise cada imagem junto com seus metadados. Identifique: subjects principais, tipo de conteudo, produtos mostrados, tom visual, texto presente, etc.\n\nApos analisar tudo, responda: "Analise concluida! Tenho ${postsData.length} posts em contexto. Pode me perguntar qualquer coisa sobre o perfil @${handle}."`
+    text: `Voce e um assistente especialista em analise de Instagram. Analise os ${postsData.length} posts do perfil @${handle}.\n\nPara cada post, a URL da imagem esta incluida nos dados — use-a para inferir o conteudo visual quando relevante.\n\nDADOS COMPLETOS:\n${textSummary}\n\nFaca uma analise completa: temas recorrentes, tipos de conteudo, performance (likes/comentarios), padroes visuais inferidos pelas URLs das imagens, dias/horarios de melhor performance.\n\nApos analisar, responda: "Analise concluida! Tenho ${postsData.length} posts em contexto. Pode me perguntar qualquer coisa sobre o perfil @${handle}."`
   }];
-  for (const img of imageParts) {
-    parts.push({ text: `\n[Imagem do Post ${img.index}]:` });
-    parts.push({ inlineData: { mimeType: img.mimeType, data: img.b64 } });
-  }
 
   return callGemini(password, [{ parts }]);
 }
