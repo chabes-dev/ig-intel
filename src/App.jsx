@@ -30,7 +30,7 @@ async function callGemini(password, contents) {
   if (res.status === 401) throw new Error("Senha incorreta");
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || "Gemini error"); }
   const data = await res.json();
-  return data.text || "Sem resposta";
+  return (data.text && data.text.trim()) || "Sem resposta";
 }
 
 async function analyzeWithGemini(password, posts, handle) {
@@ -268,7 +268,7 @@ export default function App() {
           <div style={{ display: "flex", gap: 10, marginBottom: 16, alignItems: "center", flexWrap: "wrap" }}>
             <input style={{ ...st.input, maxWidth: 240 }} placeholder="Filtrar por keyword..." value={keyword} onChange={(e) => setKeyword(e.target.value)} />
             <button style={st.btnSm} onClick={() => exportCSV(filtered, handle)}>Exportar CSV</button>
-            <button style={{ ...st.btnAI, opacity: analyzing ? 0.6 : 1 }} onClick={handleAnalyze} disabled={analyzing}>
+            <button style={{ ...st.btnAI, opacity: analyzing ? 0.6 : 1 }} onClick={handleAnalyze} disabled={analyzing} disabled={aiLoading} disabled={loading}>
               {analyzing ? "Analisando..." : "✨ Analisar com AI"}
             </button>
           </div>
