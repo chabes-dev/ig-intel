@@ -29,7 +29,7 @@ export default async function handler(req, res) {
         "Authorization": "Bearer " + groqKey,
       },
       body: JSON.stringify({
-        model: "llama-3.1-8b-instant",
+        model: "meta-llama/llama-4-scout-17b-16e-instruct",
         messages,
         max_tokens: 2048,
       }),
