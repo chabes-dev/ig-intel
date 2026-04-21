@@ -1,5 +1,5 @@
 const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || "igintel2024";
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODELS = ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.5-flash"];
 const BASE_URL = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}`
   : "https://ig-intel-five.vercel.app";
@@ -67,7 +67,7 @@ export default async function handler(req, res) {
 
   try {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODELS[0]}:generateContent?key=${geminiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -78,8 +78,16 @@ export default async function handler(req, res) {
       }
     );
 
-    const data = await response.json();
-    if (!response.ok) {
+    let data = await response.json();
+    if (!response.ok && data.error?.message?.includes("high demand")) {
+      // Retry with fallback model
+      const r2 = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODELS[1]}:generateContent?key=${geminiKey}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: geminiContents, generationConfig: { maxOutputTokens: 1500, temperature: 0.7 } }) }
+      );
+      data = await r2.json();
+      if (!r2.ok) return res.status(500).json({ error: data.error?.message || "Gemini API error" });
+    } else if (!response.ok) {
       return res.status(500).json({ error: data.error?.message || "Gemini API error" });
     }
 
