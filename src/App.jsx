@@ -2,7 +2,6 @@ import { useState, useEffect, useRef } from "react";
 
 const SEARCHES_KEY = "ig_intel_searches";
 const ACCESS_PASSWORD_KEY = "ig_intel_password";
-const GEMINI_KEY_KEY = "ig_intel_gemini_key";
 const fmt = (n) => n?.toLocaleString("pt-BR") ?? "-";
 const fmtDate = (iso) => iso ? new Date(iso).toLocaleDateString("pt-BR") : "-";
 const typeLabel = { Image: "Foto", Video: "Video", Sidecar: "Carrossel" };
@@ -22,7 +21,18 @@ function exportCSV(posts, handle) {
   a.click();
 }
 
-async function analyzeWithGemini(geminiKey, posts, handle) {
+async function callGemini(password, contents) {
+  const res = await fetch("/api/gemini", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-access-password": password },
+    body: JSON.stringify({ contents }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Gemini error");
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "Sem resposta";
+}
+
+async function buildAnalysisContents(posts, handle) {
   const postsData = posts.slice(0, 50).map((p, i) => ({
     index: i + 1,
     type: p.type,
@@ -33,80 +43,33 @@ async function analyzeWithGemini(geminiKey, posts, handle) {
     imageUrl: p.displayUrl || null,
   }));
 
-  const imageParts = [];
-  for (const p of postsData) {
-    if (p.imageUrl) {
-      try {
-        const res = await fetch("/api/img?url=" + encodeURIComponent(p.imageUrl));
-        if (res.ok) {
-          const blob = await res.blob();
-          const b64 = await new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result.split(",")[1]);
-            reader.readAsDataURL(blob);
-          });
-          imageParts.push({
-            index: p.index,
-            b64,
-            mimeType: blob.type || "image/jpeg",
-          });
-        }
-      } catch {}
-    }
-  }
-
+  const parts = [];
   const textSummary = postsData.map(p =>
     `[Post ${p.index}] ${p.type} | ${p.date} | Likes: ${p.likes} | Comments: ${p.comments}\nCaption: ${p.caption}`
   ).join("\n\n");
 
-  const parts = [
-    {
-      text: `Você é um assistente especialista em análise de Instagram. Analise os ${postsData.length} posts do perfil @${handle} abaixo.\n\nDADOS DOS POSTS:\n${textSummary}\n\nIMAGENS (${imageParts.length} disponíveis abaixo):\nAnalise cada imagem junto com seus metadados. Identifique: subjects principais, tipo de conteúdo, produtos mostrados, tom visual, texto presente, etc.\n\nApós analisar tudo, responda: "Análise concluída! Tenho ${postsData.length} posts em contexto. Pode me perguntar qualquer coisa sobre o perfil @${handle}."`
-    }
-  ];
+  parts.push({
+    text: `Você é um assistente especialista em análise de Instagram. Analise os ${postsData.length} posts do perfil @${handle}.\n\nDADOS:\n${textSummary}\n\nIMAGENS abaixo. Para cada imagem identifique: subjects, tipo de conteúdo, produtos, tom visual, texto presente.\n\nAo final responda: "Análise concluída! Tenho ${postsData.length} posts em contexto. Pergunte o que quiser sobre @${handle}."`
+  });
 
-  for (const img of imageParts) {
-    parts.push({ text: `\n[Imagem do Post ${img.index}]:` });
-    parts.push({ inlineData: { mimeType: img.mimeType, data: img.b64 } });
+  // Fetch images via proxy and encode as base64
+  for (const p of postsData) {
+    if (!p.imageUrl) continue;
+    try {
+      const r = await fetch("/api/img?url=" + encodeURIComponent(p.imageUrl));
+      if (!r.ok) continue;
+      const blob = await r.blob();
+      const b64 = await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result.split(",")[1]);
+        reader.readAsDataURL(blob);
+      });
+      parts.push({ text: `[Post ${p.index} - ${p.date} - Likes:${p.likes}]:` });
+      parts.push({ inlineData: { mimeType: blob.type || "image/jpeg", data: b64 } });
+    } catch {}
   }
 
-  const res = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + geminiKey,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contents: [{ parts }] }),
-    }
-  );
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || "Gemini error " + res.status);
-  }
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "Sem resposta";
-}
-
-async function chatWithGemini(geminiKey, history, userMessage) {
-  const contents = history.map(m => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.text }],
-  }));
-  contents.push({ role: "user", parts: [{ text: userMessage }] });
-
-  const res = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + geminiKey,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contents }),
-    }
-  );
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || "Gemini error " + res.status);
-  }
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "Sem resposta";
+  return [{ parts }];
 }
 
 export default function App() {
@@ -126,11 +89,8 @@ export default function App() {
   const [searches, setSearches] = useState(() => { try { return JSON.parse(localStorage.getItem(SEARCHES_KEY) || "[]"); } catch { return []; } });
   const pollRef = useRef(null);
 
-  // AI Chat state
-  const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem(GEMINI_KEY_KEY) || "");
-  const [showGeminiSetup, setShowGeminiSetup] = useState(false);
-  const [geminiKeyInput, setGeminiKeyInput] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
+  const [analysisContents, setAnalysisContents] = useState(null);
   const [chatHistory, setChatHistory] = useState([]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -158,7 +118,7 @@ export default function App() {
     e.preventDefault();
     if (!handle) return;
     if (pollRef.current) clearInterval(pollRef.current);
-    setLoading(true); setError(""); setStatus("Iniciando scraper..."); setPosts([]); setFiltered([]); setChatHistory([]);
+    setLoading(true); setError(""); setStatus("Iniciando scraper..."); setPosts([]); setFiltered([]); setChatHistory([]); setAnalysisContents(null);
     try {
       const startRes = await fetch("/api/start", {
         method: "POST",
@@ -168,7 +128,7 @@ export default function App() {
       if (startRes.status === 401) { setUnlocked(false); setPassword(""); localStorage.removeItem(ACCESS_PASSWORD_KEY); throw new Error("Senha incorreta"); }
       if (!startRes.ok) { const e = await startRes.json().catch(() => ({})); throw new Error(e.error || "Erro ao iniciar"); }
       const { runId, datasetId } = await startRes.json();
-      setStatus("Scraper rodando... aguardando resultados");
+      setStatus("Scraper rodando...");
       let attempts = 0;
       pollRef.current = setInterval(async () => {
         attempts++;
@@ -180,7 +140,7 @@ export default function App() {
             clearInterval(pollRef.current);
             setStatus("Buscando resultados...");
             const resultsRes = await fetch("/api/results?datasetId=" + datasetId, { headers: { "x-access-password": password } });
-            if (!resultsRes.ok) { const e = await resultsRes.json().catch(() => ({})); throw new Error(e.error || "Erro ao buscar resultados"); }
+            if (!resultsRes.ok) { const e = await resultsRes.json().catch(() => ({})); throw new Error(e.error || "Erro"); }
             const items = await resultsRes.json();
             setPosts(items); setFiltered(items); setStatus(""); setLoading(false);
             const entry = { handle, date: new Date().toISOString(), count: items.length };
@@ -202,12 +162,13 @@ export default function App() {
   }
 
   async function handleAnalyze() {
-    if (!geminiKey) { setShowGeminiSetup(true); return; }
     setAnalyzing(true);
     setChatHistory([]);
     try {
-      const result = await analyzeWithGemini(geminiKey, posts, handle);
-      setChatHistory([{ role: "assistant", text: result }]);
+      const contents = await buildAnalysisContents(posts, handle);
+      setAnalysisContents(contents);
+      const reply = await callGemini(password, contents);
+      setChatHistory([{ role: "assistant", text: reply }]);
     } catch (err) {
       setChatHistory([{ role: "assistant", text: "Erro: " + err.message }]);
     } finally {
@@ -224,22 +185,22 @@ export default function App() {
     setChatHistory(newHistory);
     setChatLoading(true);
     try {
-      const reply = await chatWithGemini(geminiKey, newHistory, userMsg);
+      // Build full conversation contents
+      const baseContents = analysisContents || [];
+      const conversationContents = [
+        ...baseContents,
+        ...newHistory.map(m => ({
+          role: m.role === "assistant" ? "model" : "user",
+          parts: [{ text: m.text }],
+        })),
+      ];
+      const reply = await callGemini(password, conversationContents);
       setChatHistory([...newHistory, { role: "assistant", text: reply }]);
     } catch (err) {
       setChatHistory([...newHistory, { role: "assistant", text: "Erro: " + err.message }]);
     } finally {
       setChatLoading(false);
     }
-  }
-
-  function saveGeminiKey(e) {
-    e.preventDefault();
-    if (!geminiKeyInput.trim()) return;
-    setGeminiKey(geminiKeyInput);
-    localStorage.setItem(GEMINI_KEY_KEY, geminiKeyInput);
-    setShowGeminiSetup(false);
-    setGeminiKeyInput("");
   }
 
   const totalLikes = filtered.reduce((s, p) => s + (p.likesCount || 0), 0);
@@ -270,7 +231,7 @@ export default function App() {
     statusBox: { background: "#1B2D5B", border: "1px solid #334155", borderRadius: 8, padding: "10px 16px", marginBottom: 16, color: "#94a3b8", display: "flex", alignItems: "center", gap: 10 },
     lockWrap: { minHeight: "100vh", background: "#0f172a", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Barlow Condensed', sans-serif" },
     lockCard: { background: "#1e2d4a", borderRadius: 16, padding: "40px 48px", width: "100%", maxWidth: 380, textAlign: "center" },
-    chatWrap: { background: "#1e2d4a", borderRadius: 12, padding: 0, marginBottom: 20, overflow: "hidden" },
+    chatWrap: { background: "#1e2d4a", borderRadius: 12, marginBottom: 20, overflow: "hidden" },
     chatHeader: { background: "#1B2D5B", padding: "12px 20px", display: "flex", alignItems: "center", gap: 10, borderBottom: "1px solid #334155" },
     chatMessages: { padding: "16px 20px", maxHeight: 400, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 },
     msgUser: { alignSelf: "flex-end", background: "#f5a020", color: "#0f172a", borderRadius: "12px 12px 2px 12px", padding: "8px 14px", maxWidth: "80%", fontSize: 14, fontWeight: 600 },
@@ -338,25 +299,6 @@ export default function App() {
       {status && <div style={st.statusBox}><span style={{ fontSize: 18 }}>⏳</span><span>{status}</span></div>}
       {error && <div style={st.errorBox}>{error}</div>}
 
-      {/* Gemini Key Setup Modal */}
-      {showGeminiSetup && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
-          <div style={{ background: "#1e2d4a", borderRadius: 16, padding: "32px", width: "90%", maxWidth: 400 }}>
-            <div style={{ fontSize: 20, fontWeight: 700, color: "#f5a020", marginBottom: 8 }}>Gemini API Key</div>
-            <div style={{ fontSize: 13, color: "#64748b", marginBottom: 20 }}>
-              Grátis em <a href="https://aistudio.google.com" target="_blank" rel="noreferrer" style={{ color: "#6366f1" }}>aistudio.google.com</a> → Get API Key
-            </div>
-            <form onSubmit={saveGeminiKey}>
-              <input style={{ ...st.input, marginBottom: 12 }} placeholder="AIza..." value={geminiKeyInput} onChange={(e) => setGeminiKeyInput(e.target.value)} autoFocus />
-              <div style={{ display: "flex", gap: 8 }}>
-                <button type="submit" style={{ ...st.btn, flex: 1 }}>Salvar</button>
-                <button type="button" style={{ ...st.btnSm, flex: 1 }} onClick={() => setShowGeminiSetup(false)}>Cancelar</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
       {posts.length > 0 && (
         <>
           <div style={st.grid4}>
@@ -372,10 +314,8 @@ export default function App() {
             <button style={{ ...st.btnAI, opacity: analyzing ? 0.6 : 1 }} onClick={handleAnalyze} disabled={analyzing}>
               {analyzing ? "Analisando..." : "✨ Analisar com AI"}
             </button>
-            {geminiKey && <button style={{ ...st.btnSm, fontSize: 11 }} onClick={() => { setGeminiKey(""); localStorage.removeItem(GEMINI_KEY_KEY); }}>Trocar key</button>}
           </div>
 
-          {/* AI Chat */}
           {(chatHistory.length > 0 || analyzing) && (
             <div style={st.chatWrap}>
               <div style={st.chatHeader}>
@@ -384,11 +324,7 @@ export default function App() {
                 <span style={{ fontSize: 12, color: "#64748b", marginLeft: 4 }}>@{handle} · {posts.length} posts</span>
               </div>
               <div style={st.chatMessages}>
-                {analyzing && (
-                  <div style={st.msgAI}>
-                    <span style={{ opacity: 0.6 }}>Analisando {posts.length} posts e imagens... isso pode levar 30-60s ⏳</span>
-                  </div>
-                )}
+                {analyzing && <div style={st.msgAI}><span style={{ opacity: 0.6 }}>Analisando {posts.length} posts e imagens... aguarde ⏳</span></div>}
                 {chatHistory.map((m, i) => (
                   <div key={i} style={m.role === "user" ? st.msgUser : st.msgAI}>{m.text}</div>
                 ))}
@@ -397,16 +333,8 @@ export default function App() {
               </div>
               {chatHistory.length > 0 && (
                 <form onSubmit={handleChat} style={st.chatInputWrap}>
-                  <input
-                    style={{ ...st.input, flex: 1 }}
-                    placeholder="Pergunte qualquer coisa sobre os posts..."
-                    value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    disabled={chatLoading || analyzing}
-                  />
-                  <button type="submit" style={{ ...st.btn, padding: "8px 16px", fontSize: 14 }} disabled={chatLoading || analyzing}>
-                    Enviar
-                  </button>
+                  <input style={{ ...st.input, flex: 1 }} placeholder="Pergunte qualquer coisa sobre os posts..." value={chatInput} onChange={(e) => setChatInput(e.target.value)} disabled={chatLoading || analyzing} />
+                  <button type="submit" style={{ ...st.btn, padding: "8px 16px", fontSize: 14 }} disabled={chatLoading || analyzing}>Enviar</button>
                 </form>
               )}
             </div>
