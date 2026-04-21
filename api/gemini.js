@@ -1,5 +1,5 @@
 const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || "igintel2024";
-const GEMINI_MODELS = ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.5-flash"];
+const GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"];
 const BASE_URL = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}`
   : "https://ig-intel-five.vercel.app";
