@@ -249,7 +249,7 @@ export default function App() {
             <div><label style={st.label}>De (data)</label><input style={st.input} type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} /></div>
             <div><label style={st.label}>Ate (data)</label><input style={st.input} type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} /></div>
           </div>
-          <button type="submit" style={{ ...st.btn, opacity: loading ? 0.6 : 1 }} disabled={loading}>{loading ? "Buscando..." : "Buscar"}</button>
+          <button type="submit" style={{ ...st.btn, opacity: loading ? 0.6 : 1 }}>{loading ? "Buscando..." : "Buscar"}</button>
         </form>
       </div>
 
@@ -268,7 +268,7 @@ export default function App() {
           <div style={{ display: "flex", gap: 10, marginBottom: 16, alignItems: "center", flexWrap: "wrap" }}>
             <input style={{ ...st.input, maxWidth: 240 }} placeholder="Filtrar por keyword..." value={keyword} onChange={(e) => setKeyword(e.target.value)} />
             <button style={st.btnSm} onClick={() => exportCSV(filtered, handle)}>Exportar CSV</button>
-            <button style={{ ...st.btnAI, opacity: analyzing ? 0.6 : 1 }} onClick={handleAnalyze} disabled={analyzing} disabled={aiLoading} disabled={loading}>
+            <button style={{ ...st.btnAI, opacity: analyzing ? 0.6 : 1 }} onClick={handleAnalyze} disabled={analyzing}>
               {analyzing ? "Analisando..." : "✨ Analisar com AI"}
             </button>
           </div>
