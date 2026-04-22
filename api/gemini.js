@@ -4,9 +4,21 @@ const BASE_URL = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}`
   : "https://ig-intel-five.vercel.app";
 
-async function fetchImageAsBase64(thumbnailUrl) {
+const SYSTEM_PROMPT = `You are a senior Instagram strategist at a top social media agency. You analyze Instagram post data to deliver sharp, actionable intelligence.
+
+You receive structured post data: index, type (Photo/Video/Carousel), date, likes, comments, and caption. You may also receive post images.
+
+Rules:
+- Base analysis strictly on the engagement numbers and content patterns in the data
+- Identify what works vs what does not — be specific, cite post numbers
+- Quantify: avg likes per content type, top/bottom performers, engagement deltas
+- Be brutally honest and concise. No filler, no pleasantries, no generic advice
+- When images are provided, describe what you visually see and connect it to performance
+- For follow-up questions, answer directly from the data`;
+
+async function fetchImageAsBase64(url) {
   try {
-    const proxied = `${BASE_URL}/api/img?url=${encodeURIComponent(thumbnailUrl)}`;
+    const proxied = `${BASE_URL}/api/img?url=${encodeURIComponent(url)}`;
     const r = await fetch(proxied, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) return null;
     const buf = await r.arrayBuffer();
@@ -34,65 +46,57 @@ export default async function handler(req, res) {
   const { contents } = req.body;
   if (!contents) return res.status(400).json({ error: "contents required" });
 
-  // Thumbnail URL pattern in text parts (Apify fields)
-  const thumbPattern = /https?:\/\/[^\s"]+(?:cdninstagram|fbcdn)[^\s"]+/g;
-
   const geminiContents = await Promise.all(contents.map(async (c) => {
     if (c.role === "model") {
       return { role: "model", parts: [{ text: c.parts.map(p => p.text || "").join("") }] };
     }
 
-    // Build parts, injecting images inline before each post text
-    const parts = [];
+    const textParts = [];
+    const imageUrls = [];
+
     for (const p of c.parts) {
-      const text = p.text || "";
-      const urls = [...new Set(text.match(thumbPattern) || [])];
-
-      // Fetch up to 5 images per turn (cap to control token usage)
-      const imageResults = await Promise.all(
-        urls.slice(0, 5).map(url => fetchImageAsBase64(url))
-      );
-
-      for (const img of imageResults) {
-        if (img) {
-          parts.push({ inlineData: { mimeType: img.mimeType, data: img.b64 } });
-        }
+      if (p.imageUrl) {
+        const urls = Array.isArray(p.imageUrl) ? p.imageUrl : [p.imageUrl];
+        imageUrls.push(...urls.filter(Boolean).slice(0, 5));
+      } else if (p.text) {
+        textParts.push({ text: p.text });
       }
-
-      if (text) parts.push({ text });
     }
 
+    const imageParts = [];
+    if (imageUrls.length > 0) {
+      const results = await Promise.all(imageUrls.map(url => fetchImageAsBase64(url)));
+      results.filter(Boolean).forEach(img => {
+        imageParts.push({ inlineData: { mimeType: img.mimeType, data: img.b64 } });
+      });
+    }
+
+    const parts = [...imageParts, ...textParts];
     return { role: "user", parts: parts.length ? parts : [{ text: "" }] };
   }));
 
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODELS[0]}:generateContent?key=${geminiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: geminiContents,
-          generationConfig: { maxOutputTokens: 1500, temperature: 0.7 }
-        })
-      }
-    );
+  const requestBody = {
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents: geminiContents,
+    generationConfig: { maxOutputTokens: 2000, temperature: 0.4 }
+  };
 
-    let data = await response.json();
-    if (!response.ok && data.error?.message?.includes("high demand")) {
-      // Retry with fallback model
-      const r2 = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODELS[1]}:generateContent?key=${geminiKey}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: geminiContents, generationConfig: { maxOutputTokens: 1500, temperature: 0.7 } }) }
+  try {
+    let data;
+    for (const model of GEMINI_MODELS) {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) }
       );
-      data = await r2.json();
-      if (!r2.ok) return res.status(500).json({ error: data.error?.message || "Gemini API error" });
-    } else if (!response.ok) {
-      return res.status(500).json({ error: data.error?.message || "Gemini API error" });
+      data = await response.json();
+      if (response.ok) break;
+      const msg = data.error?.message || "";
+      if (!msg.includes("high demand") && !msg.includes("not found")) break;
     }
 
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "No response";
-    return res.status(200).json({ text });
+    if (data?.error) return res.status(500).json({ error: data.error.message });
+    const text = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+    return res.status(200).json({ text: text || "Sem resposta" });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
