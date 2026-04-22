@@ -42,6 +42,7 @@ async function analyzeWithGemini(password, posts, handle) {
     comments: p.commentsCount || 0,
     caption: (p.caption || "").slice(0, 400),
     url: p.url || (p.shortCode && "https://www.instagram.com/p/" + p.shortCode + "/") || "",
+    thumbnailUrl: p.thumbnailUrl || p.displayUrl || "",
     imageUrl: p.displayUrl || "",
   }));
 
